@@ -1,0 +1,8 @@
+numpy>=2,<2.3
+# CUDA 12 build; 1.27+ targets CUDA 13, which dropped Pascal (Tesla P4).
+onnxruntime-gpu==1.22.0
+insightface==0.7.3
+hdbscan>=0.8.44
+opencv-python-headless
+pillow
+tqdm
