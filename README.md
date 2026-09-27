@@ -45,6 +45,10 @@ Re-cluster without re-running detection (takes seconds):
 - Different people merged (e.g. siblings) → raise `--merge-thresh` (e.g. 0.6; `1` disables merging), or raise `--min-samples` / `--min-cluster-size`
 - Too many junk faces (tiny, blurry, background) → raise `--det-thresh` (0.6) or `--min-face` (40 px)
 
+Speed: `--workers` (default 4) is how many photos are processed at once. On the GPU, raise it
+(e.g. 6–8) if `nvidia-smi` shows `GPU-Util` well below 100% during detection. GPU memory
+use (~0.5–1 GB) is normal and doesn't limit speed.
+
 Each run replaces all person folders (renamed ones too), `unknown` and `no_faces` in the
 output directory. Don't keep your own files in them.
 Set `NO_GPU=1` to run on a machine without a GPU.

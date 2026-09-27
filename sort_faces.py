@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import warnings
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -40,7 +41,7 @@ def parse_args():
     ap.add_argument("--min-face", type=int, default=40, help="min face size in px (on the resized image)")
     ap.add_argument("--max-side", type=int, default=1600, help="resize photos so longest side <= this")
     ap.add_argument("--det-size", type=int, default=640, help="detector input size")
-    ap.add_argument("--workers", type=int, default=4, help="threads decoding photos ahead of the GPU")
+    ap.add_argument("--workers", type=int, default=4, help="photos processed in parallel (decode + GPU inference)")
     ap.add_argument("--cpu", action="store_true", help="force CPU inference")
     ap.add_argument("--recluster", action="store_true", help="reuse cached embeddings, skip detection")
     return ap.parse_args()
@@ -63,13 +64,13 @@ def load_image(path, max_side=None):
     return np.ascontiguousarray(np.asarray(im)[:, :, ::-1]), scale
 
 
-def iter_images(paths, max_side, workers):
-    """Yield (path, image, scale, error) in order, decoding up to 2*workers photos ahead."""
+def iter_parallel(paths, fn, workers):
+    """Yield (path, fn(path), error) in input order, running up to 2*workers calls ahead."""
     def job(p):
         try:
-            return p, *load_image(p, max_side), None
+            return p, fn(p), None
         except Exception as e:
-            return p, None, None, str(e)
+            return p, None, str(e)
 
     with ThreadPoolExecutor(workers) as ex:
         it = iter(paths)
@@ -116,29 +117,56 @@ def build_app(det_size, force_cpu):
         print(f"Using GPU (onnxruntime {ort.__version__})")
     else:
         print("!! Running on CPU - this will be slower", file=sys.stderr)
-    return app
+    return app, "CUDAExecutionProvider" in used
+
+
+def embed_faces(app, img, args):
+    """Detect faces, drop weak/tiny ones, then embed the rest in one recognition batch.
+
+    Same result as FaceAnalysis.get(), which runs recognition once per face, even for faces
+    we would discard.
+    """
+    from insightface.utils import face_align
+
+    dets, kpss = app.det_model.detect(img, max_num=0, metric="default")
+    keep = [i for i, (x1, y1, x2, y2, score) in enumerate(dets)
+            if score >= args.det_thresh and min(x2 - x1, y2 - y1) >= args.min_face]
+    if not keep:
+        return dets[:0], np.empty((0, 512), dtype=np.float32)
+    rec = app.models["recognition"]
+    crops = [face_align.norm_crop(img, landmark=kpss[i], image_size=rec.input_size[0]) for i in keep]
+    feats = rec.get_feat(crops)
+    return dets[keep], (feats / np.linalg.norm(feats, axis=1, keepdims=True)).astype(np.float32)
 
 
 def detect(photos, input_root, args):
-    app = build_app(args.det_size, args.cpu)
+    app, on_gpu = build_app(args.det_size, args.cpu)
+    # On the GPU, concurrent calls keep it busy while other threads decode and post-process.
+    # On the CPU, onnxruntime already uses every core, so parallel inference only adds contention.
+    infer_lock = contextlib.nullcontext() if on_gpu else threading.Lock()
+
+    def process(path):
+        img, scale = load_image(path, args.max_side)
+        with infer_lock:
+            dets, feats = embed_faces(app, img, args)
+        return dets, feats, scale
+
     index = {p: i for i, p in enumerate(photos)}
     faces, embs, failed = [], [], {}
-    images = iter_images(photos, args.max_side, args.workers)
-    for path, img, scale, err in tqdm(images, total=len(photos), desc="Detecting", unit="photo"):
+    results = iter_parallel(photos, process, args.workers)
+    for path, result, err in tqdm(results, total=len(photos), desc="Detecting", unit="photo"):
         i = index[path]
         if err:
             failed[i] = err
             continue
-        for f in app.get(img):
-            x1, y1, x2, y2 = f.bbox
-            if f.det_score < args.det_thresh or min(x2 - x1, y2 - y1) < args.min_face:
-                continue
+        dets, feats, scale = result
+        for det, feat in zip(dets, feats):
             faces.append({
                 "photo": i,
-                "bbox": (f.bbox / scale).round(1).tolist(),  # original-image coordinates
-                "score": round(float(f.det_score), 4),
+                "bbox": (det[:4] / scale).round(1).tolist(),  # original-image coordinates
+                "score": round(float(det[4]), 4),
             })
-            embs.append(f.normed_embedding)
+            embs.append(feat)
     embs = np.asarray(embs, dtype=np.float32).reshape(-1, 512)
     meta = {
         "input": str(input_root),
